@@ -1299,6 +1299,38 @@ test_self_heal_target_full()
     fi
 }
 
+# A self-heal of shared data goes by the shared data's options, whatever the
+# reader's. dst, which holds the clone, has data_replicas=1, and the shared
+# data has two replicas: by dst's options the self-heal needs no new replica
+# and writes nothing, and the replica that failed its checksum stays.
+test_self_heal_reflink_data_replicas()
+{
+    ktest_expect_device_errors=1
+    [[ -f /sys/module/bcachefs/parameters/read_corrupt_ratio ]] || return 0
+    set_watchdog 120
+
+    local retries
+    self_heal_setup slow
+    mkdir /mnt/src /mnt/dst
+    bcachefs set-file-option --data_replicas=1 /mnt/dst
+    dd if=/dev/urandom of=/mnt/src/f bs=1M count=8 oflag=direct
+    cp --reflink=always /mnt/src/f /mnt/dst/f
+    self_heal_reconcile_off
+    self_heal_read /mnt/dst/f
+    retries=$(awk '/since mount/ { print $3 }' /sys/fs/bcachefs/*-*-*-*-*/counters/data_read_retry)
+    echo "read retries: $retries"
+    self_heal_end
+
+    if (( retries == 0 )); then
+	echo "ERROR: no read was retried - this run tests nothing"
+	exit 1
+    fi
+    if (( self_heal_kib[0] + self_heal_kib[1] + self_heal_kib[2] < 8192 )); then
+	echo "ERROR: the self-heal of shared data wrote nothing: it went by the reader's data_replicas"
+	exit 1
+    fi
+}
+
 # ---- reconcile target placement tests ----
 #
 # A target with less durability than data_replicas/metadata_replicas (e.g.
