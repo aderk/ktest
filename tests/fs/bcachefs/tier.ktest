@@ -1271,6 +1271,81 @@ test_reflink_keeps_derived_background_target_none()
     bcachefs_test_end_checks "${devs[0]}"
 }
 
+# On a filesystem with foreground_target=ssd and no background_target, a clone
+# of a file without options of its own has no record: all of its options are
+# the filesystem's. Giving the file the filesystem's foreground_target, by
+# setattr or by moving it into a directory that has it, changes no value but
+# makes the derived background_target the inode's. The change queues a scan
+# that records it with the shared data, which then stays on ssd when the
+# filesystem's foreground_target becomes hdd.
+#
+# reflink_derived_provenance <setattr|rename>
+reflink_derived_provenance()
+{
+    set_watchdog 240
+
+    local devs=("${ktest_scratch_dev[@]:0:3}")
+    run_quiet "" bcachefs format -f		\
+	--foreground_target=ssd			\
+	--label=ssd.ssd0 "${devs[0]}"		\
+	--label=hdd.hdd0 "${devs[1]}"		\
+	--label=hdd.hdd1 "${devs[2]}"
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+
+    mkdir /mnt/a /mnt/fast
+    bcachefs set-file-option --foreground_target=ssd /mnt/fast
+    dd if=/dev/urandom of=/mnt/a/f bs=1M count=8 oflag=direct
+    cp --reflink=always /mnt/a/f /mnt/a/g
+    timeout 60 bcachefs reconcile wait /mnt
+
+    local keys s
+    keys=$(reflink_derived_keys "${devs[@]}")
+    if grep -q "(inode)" <<< "$keys"; then
+	echo "ERROR: the shared data has a record of the inode's options already - this run tests nothing"
+	exit 1
+    fi
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+
+    case $1 in
+	setattr)	bcachefs set-file-option --foreground_target=ssd /mnt/a/f ;;
+	rename)		mv /mnt/a/f /mnt/fast/f ;;
+    esac
+    reflink_derived_wait
+
+    keys=$(reflink_derived_keys "${devs[@]}")
+    echo "$keys" | head -20
+    if ! grep -q "background_target=ssd (inode)" <<< "$keys"; then
+	echo "ERROR: the $1 didn't record the inode's background_target with the shared data"
+	exit 1
+    fi
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+
+    reflink_derived_set foreground_target hdd
+    keys=$(reflink_derived_keys "${devs[@]}")
+    s=($(reflink_derived_ptrs "$keys" "${devs[@]}"))
+    echo "shared data pointers: ${s[0]} on ssd, ${s[1]} on hdd"
+
+    if (( s[0] + s[1] == 0 )); then
+	echo "ERROR: no shared data found - this run tests nothing"
+	exit 1
+    fi
+    if (( s[1] > 0 )); then
+	echo "ERROR: shared data followed the filesystem's foreground_target"
+	exit 1
+    fi
+    bcachefs_test_end_checks "${devs[0]}"
+}
+
+test_reflink_derived_provenance_setattr()
+{
+    reflink_derived_provenance setattr
+}
+
+test_reflink_derived_provenance_rename()
+{
+    reflink_derived_provenance rename
+}
+
 # A read of shared data promotes by the shared data's own options, not the
 # reader's: the promote's index update judges the copy by them, so a copy made
 # to the reader's promote_target would be dropped and written again on every
