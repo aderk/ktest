@@ -1141,6 +1141,44 @@ test_reflink_promote_src_target()
     reflink_promote_check 2 1
 }
 
+# Both sides of the clone read the shared data by its options, whatever their
+# own promote targets: dst/f's first read promotes to fast, and no later read
+# of dst/f or src/f promotes again. When each reader promoted to its own
+# target, every read wrote the data again.
+test_reflink_promote_two_readers()
+{
+    set_watchdog 120
+
+    local devs=("${ktest_scratch_dev[@]:0:4}") f w0 w1 first=-1 again=0
+    reflink_promote_setup dst
+    for f in dst src dst src; do
+	w0=$(( $(reflink_promote_written "${devs[1]}") + $(reflink_promote_written "${devs[2]}") ))
+	dd if="/mnt/$f/f" of=/dev/null bs=1M iflag=direct status=none
+	reflink_promote_settle "${devs[1]}"
+	reflink_promote_settle "${devs[2]}"
+	w1=$(( $(reflink_promote_written "${devs[1]}") + $(reflink_promote_written "${devs[2]}") ))
+	echo "$f/f read: $(( (w1 - w0) / 2 )) KiB to fast and cache"
+	if (( first < 0 )); then
+	    first=$(( w1 - w0 ))
+	else
+	    again=$(( again + w1 - w0 ))
+	fi
+    done
+
+    umount /mnt
+    bcachefs fsck -ny "${devs[@]}"
+
+    if (( first < 8192 )); then
+	echo "ERROR: the first read didn't promote - this run tests nothing"
+	exit 1
+    fi
+    if (( again >= 1024 )); then
+	echo "ERROR: a later read promoted again: the readers don't agree on the shared data's target"
+	exit 1
+    fi
+    bcachefs_test_end_checks "${devs[0]}"
+}
+
 # ---- reconcile target placement tests ----
 #
 # A target with less durability than data_replicas/metadata_replicas (e.g.
