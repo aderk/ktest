@@ -1064,15 +1064,18 @@ reflink_promote_setup()
 # not, and the copy must still be there
 reflink_promote_check()
 {
-    local devs=("${ktest_scratch_dev[@]:0:4}") w0 w1 w2
+    local devs=("${ktest_scratch_dev[@]:0:4}") w0 w1 w2 r0 r2
     w0=$(reflink_promote_written "${devs[1]}")
+    r0=$(reflink_promote_written "${devs[2]}")
     dd if=/mnt/dst/f of=/dev/null bs=1M iflag=direct status=none
     reflink_promote_settle "${devs[1]}"
     w1=$(reflink_promote_written "${devs[1]}")
     dd if=/mnt/dst/f of=/dev/null bs=1M iflag=direct status=none
     reflink_promote_settle "${devs[1]}"
     w2=$(reflink_promote_written "${devs[1]}")
+    r2=$(reflink_promote_written "${devs[2]}")
     echo "written to the promote target: first read $(( (w1 - w0) / 2 )) KiB, second read $(( (w2 - w1) / 2 )) KiB"
+    echo "written to dst's promote target: $(( (r2 - r0) / 2 )) KiB"
 
     local keys cached
     umount /mnt
@@ -1082,6 +1085,10 @@ reflink_promote_check()
     cached=$(grep -E "ptr:[[:space:]]*$(basename "${devs[1]}") " <<< "$keys" | grep -c cached || true)
     echo "cached pointers on the promote target: $cached"
 
+    if (( r2 - r0 >= 1024 )); then
+	echo "ERROR: shared data was promoted to the reader's promote_target"
+	exit 1
+    fi
     if (( w1 - w0 < 8192 )); then
 	echo "ERROR: the first read didn't promote - this run tests nothing"
 	exit 1
