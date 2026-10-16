@@ -906,18 +906,24 @@ test_reflink_inode_opts()
 # a filesystem option, which queues a scan of every extent, so the record is
 # checked again.
 
-# reflink_derived_rescan <promote_target>: set the filesystem's promote_target,
-# which queues a reconcile scan of every extent, and let reconcile finish
-reflink_derived_rescan()
+# reflink_derived_set <option> <value>: set a filesystem option, which queues a
+# reconcile scan of every extent, and let reconcile finish
+reflink_derived_set()
 {
     local sysfs i
     sysfs=$(echo /sys/fs/bcachefs/*-*-*-*-*)
-    echo "$1" > "$sysfs/options/promote_target"
+    echo "$2" > "$sysfs/options/$1"
     for (( i = 0; i < 3; i++ )); do
 	echo 1 > "$sysfs/internal/trigger_reconcile_wakeup"
 	timeout 60 bcachefs reconcile wait /mnt
 	sleep 2
     done
+}
+
+# reflink_derived_rescan <promote_target>: reflink_derived_set promote_target
+reflink_derived_rescan()
+{
+    reflink_derived_set promote_target "$1"
 }
 
 # reflink_derived_keys <devs>...: unmounts, then prints the reflink btree
@@ -1002,6 +1008,129 @@ test_reflink_keeps_derived_background_compression()
     fi
     if (( none > 0 )); then
 	echo "ERROR: reconcile rewrote shared data uncompressed"
+	exit 1
+    fi
+    bcachefs_test_end_checks "${devs[0]}"
+}
+
+# A rewrite keeps the old copy as a cached pointer, so these two count dirty
+# pointers only.
+
+# reflink_derived_ptrs <keys> <devs>...: "<on devs[0]> <on the other devs>"
+reflink_derived_ptrs()
+{
+    local keys first=$2 rest=("${@:3}") a b
+    keys=$(grep -v cached <<< "$1")
+    a=$(grep -cE "ptr:[[:space:]]*$(basename "$first") " <<< "$keys" || true)
+    b=$(grep -cE "ptr:[[:space:]]*($(join_by '|' $(basename -a "${rest[@]}"))) " <<< "$keys" || true)
+    echo "$a $b"
+}
+
+# reflink_derived_compression <keys>: "<lz4> <uncompressed>"
+reflink_derived_compression()
+{
+    awk '/ type / { c = "" }
+	 /compress / { c = $0 }
+	 /ptr:/ && !/cached/ { if (c ~ /compress lz4/) l++; else if (c ~ /compress none/) n++ }
+	 END { print l + 0, n + 0 }' <<< "$1"
+}
+
+# A directory with only compression=none, on a filesystem with
+# compression=lz4: the inode's background_compression is none, so after a
+# reflink the shared data stays uncompressed, as an unshared file there does.
+test_reflink_keeps_derived_background_compression_none()
+{
+    set_watchdog 120
+
+    local devs=("${ktest_scratch_dev[@]:0:3}")
+    run_quiet "" bcachefs format -f		\
+	--compression=lz4			\
+	--label=hdd.hdd0 "${devs[0]}"		\
+	--label=hdd.hdd1 "${devs[1]}"		\
+	--label=hdd.hdd2 "${devs[2]}"
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+
+    mkdir /mnt/c
+    bcachefs set-file-option --compression=none /mnt/c
+
+    awk 'BEGIN { for (i = 0; i < 230000; i++) print "bcachefs reflink derived compression" }' > /mnt/c/f
+    cp --reflink=never /mnt/c/f /mnt/c/u
+    sync /mnt/c/f /mnt/c/u
+    cp --reflink=always /mnt/c/f /mnt/c/g
+    local ino
+    ino=$(stat -c %i /mnt/c/u)
+    reflink_derived_rescan hdd
+
+    local keys unshared s u
+    keys=$(reflink_derived_keys "${devs[@]}")
+    unshared=$(bcachefs list -b extents -s "$ino:0" -e "$((ino + 1)):0" "${devs[@]}")
+    echo "$keys" | head -40
+    s=($(reflink_derived_compression "$keys"))
+    u=($(reflink_derived_compression "$unshared"))
+    echo "shared extents: ${s[0]} lz4, ${s[1]} uncompressed"
+    echo "unshared extents: ${u[0]} lz4, ${u[1]} uncompressed"
+
+    if (( s[0] + s[1] == 0 )); then
+	echo "ERROR: no shared extents - this run tests nothing"
+	exit 1
+    fi
+    if (( u[0] > 0 || u[1] == 0 )); then
+	echo "ERROR: the unshared file was compressed too - this run tests nothing"
+	exit 1
+    fi
+    if (( s[0] > 0 )); then
+	echo "ERROR: reconcile compressed shared data by the filesystem's compression"
+	exit 1
+    fi
+    bcachefs_test_end_checks "${devs[0]}"
+}
+
+# A file in a directory with only foreground_target=ssd is cloned while the
+# filesystem has no background_target. When the filesystem then sets
+# background_target=hdd, that becomes the inode's background_target as well,
+# so the shared data moves to hdd with the directory's unshared data.
+test_reflink_derived_background_target_follows_fs()
+{
+    set_watchdog 240
+
+    local devs=("${ktest_scratch_dev[@]:0:3}")
+    run_quiet "" bcachefs format -f		\
+	--foreground_target=hdd			\
+	--label=ssd.ssd0 "${devs[0]}"		\
+	--label=hdd.hdd0 "${devs[1]}"		\
+	--label=hdd.hdd1 "${devs[2]}"
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+
+    mkdir /mnt/fast
+    bcachefs set-file-option --foreground_target=ssd /mnt/fast
+
+    dd if=/dev/urandom of=/mnt/fast/f bs=1M count=8 oflag=direct
+    dd if=/dev/urandom of=/mnt/fast/u bs=1M count=8 oflag=direct
+    cp --reflink=always /mnt/fast/f /mnt/fast/g
+    local ino
+    ino=$(stat -c %i /mnt/fast/u)
+    timeout 60 bcachefs reconcile wait /mnt
+    reflink_derived_set background_target hdd
+
+    local keys unshared s u
+    keys=$(reflink_derived_keys "${devs[@]}")
+    unshared=$(bcachefs list -b extents -s "$ino:0" -e "$((ino + 1)):0" "${devs[@]}")
+    echo "$keys" | head -20
+    s=($(reflink_derived_ptrs "$keys" "${devs[@]}"))
+    u=($(reflink_derived_ptrs "$unshared" "${devs[@]}"))
+    echo "shared data pointers: ${s[0]} on ssd, ${s[1]} on hdd"
+    echo "unshared data pointers: ${u[0]} on ssd, ${u[1]} on hdd"
+
+    if (( u[0] > 0 || u[1] == 0 )); then
+	echo "ERROR: the unshared file didn't move to the new background_target - this run tests nothing"
+	exit 1
+    fi
+    if (( s[0] + s[1] == 0 )); then
+	echo "ERROR: no shared data found - this run tests nothing"
+	exit 1
+    fi
+    if (( s[0] > 0 )); then
+	echo "ERROR: shared data kept the derived background_target after the filesystem set one"
 	exit 1
     fi
     bcachefs_test_end_checks "${devs[0]}"
