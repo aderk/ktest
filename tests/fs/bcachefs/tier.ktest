@@ -1119,6 +1119,73 @@ test_reflink_promote_sticks_over_replicated()
     reflink_promote_check
 }
 
+# snapshot_promote_read <file> <n>: reads <file> with O_DIRECT, prints what
+# read <n> wrote to fast and to cache, and sets snapshot_promote_wrote to the
+# sectors written to both
+snapshot_promote_read()
+{
+    local devs=("${ktest_scratch_dev[@]:0:4}") f0 c0 f1 c1
+    f0=$(reflink_promote_written "${devs[1]}")
+    c0=$(reflink_promote_written "${devs[2]}")
+    dd if="$1" of=/dev/null bs=1M iflag=direct status=none
+    reflink_promote_settle "${devs[2]}"
+    reflink_promote_settle "${devs[1]}"
+    f1=$(reflink_promote_written "${devs[1]}")
+    c1=$(reflink_promote_written "${devs[2]}")
+    echo "$1 read $2: $(( (f1 - f0) / 2 )) KiB to fast, $(( (c1 - c0) / 2 )) KiB to cache"
+    snapshot_promote_wrote=$(( f1 - f0 + c1 - c0 ))
+}
+
+# A snapshot shares its extents with the subvolume it was taken from, and an
+# inode option set on one side propagates to the shared ancestor inode unless
+# another branch claims a different value: then the master subvolume's wins.
+# sv/f (the master) sets promote_target=cache and snap/f sets fast; each is
+# read twice, and neither's second read may promote again.
+test_snapshot_promote_branches()
+{
+    set_watchdog 180
+
+    local devs=("${ktest_scratch_dev[@]:0:4}") a1 a2 b1 b2 b3
+    run_quiet "" bcachefs format -f			\
+	--foreground_target=slow			\
+	--background_target=slow			\
+	--promote_target=fast				\
+	--label=slow.slow0 "${devs[0]}"			\
+	--label=fast.fast0 "${devs[1]}"			\
+	--label=cache.cache0 "${devs[2]}"		\
+	--label=slow.slow1 "${devs[3]}"
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+
+    bcachefs subvolume create /mnt/sv
+    dd if=/dev/urandom of=/mnt/sv/f bs=1M count=8 oflag=direct
+    bcachefs subvolume snapshot /mnt/sv /mnt/snap
+    bcachefs set-file-option --promote_target=cache /mnt/sv/f
+    bcachefs set-file-option --promote_target=fast /mnt/snap/f
+    timeout 60 bcachefs reconcile wait /mnt
+    bcachefs get-file-option -e /mnt/sv/f /mnt/snap/f
+
+    snapshot_promote_read /mnt/snap/f 1; b1=$snapshot_promote_wrote
+    snapshot_promote_read /mnt/snap/f 2; b2=$snapshot_promote_wrote
+    snapshot_promote_read /mnt/sv/f 1; a1=$snapshot_promote_wrote
+    snapshot_promote_read /mnt/sv/f 2; a2=$snapshot_promote_wrote
+    snapshot_promote_read /mnt/snap/f 3; b3=$snapshot_promote_wrote
+
+    umount /mnt
+    bcachefs list -b inodes "${devs[@]}" > /tmp/inodes
+    grep -aE "^u64s.*inode|promote_target" /tmp/inodes
+    bcachefs fsck -ny "${devs[@]}"
+
+    if (( b1 + a1 < 8192 )); then
+	echo "ERROR: nothing promoted - this run tests nothing"
+	exit 1
+    fi
+    if (( b2 >= 1024 || a2 >= 1024 || b3 >= 1024 )); then
+	echo "ERROR: a read promoted again: an earlier read's copy wasn't kept"
+	exit 1
+    fi
+    bcachefs_test_end_checks "${devs[0]}"
+}
+
 # ---- reconcile target placement tests ----
 #
 # A target with less durability than data_replicas/metadata_replicas (e.g.
