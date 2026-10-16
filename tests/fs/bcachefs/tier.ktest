@@ -1035,11 +1035,13 @@ reflink_promote_settle()
     done
 }
 
-# reflink_promote_setup <format args>...: src inherits promote_target=fast,
-# dst has promote_target=cache, and dst/f is a clone of src/f
+# reflink_promote_setup <src|dst> <format args>...: the filesystem's
+# promote_target is fast, the named directory's is cache, and dst/f is a clone
+# of src/f
 reflink_promote_setup()
 {
-    local devs=("${ktest_scratch_dev[@]:0:4}")
+    local dir=$1 devs=("${ktest_scratch_dev[@]:0:4}")
+    shift
     run_quiet "" bcachefs format -f			\
 	--foreground_target=slow			\
 	--background_target=slow			\
@@ -1052,28 +1054,30 @@ reflink_promote_setup()
     mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
 
     mkdir /mnt/src /mnt/dst
-    bcachefs set-file-option --promote_target=cache /mnt/dst
+    bcachefs set-file-option --promote_target=cache "/mnt/$dir"
 
     dd if=/dev/urandom of=/mnt/src/f bs=1M count=8 oflag=direct
     cp --reflink=always /mnt/src/f /mnt/dst/f
     timeout 60 bcachefs reconcile wait /mnt
 }
 
-# reflink_promote_check: reads dst/f twice; the first read must promote to
-# fast - the shared data's promote target, not dst's cache - the second must
-# not, and the copy must still be there
+# reflink_promote_check <i> <j>: reads dst/f twice; the first read must
+# promote to scratch device <i>, the shared data's promote target, and nothing
+# may go to <j>, dst's; the second must not promote, and the copy must still
+# be there
 reflink_promote_check()
 {
     local devs=("${ktest_scratch_dev[@]:0:4}") w0 w1 w2 r0 r2
-    w0=$(reflink_promote_written "${devs[1]}")
-    r0=$(reflink_promote_written "${devs[2]}")
+    local target=${devs[$1]} reader=${devs[$2]}
+    w0=$(reflink_promote_written "$target")
+    r0=$(reflink_promote_written "$reader")
     dd if=/mnt/dst/f of=/dev/null bs=1M iflag=direct status=none
-    reflink_promote_settle "${devs[1]}"
-    w1=$(reflink_promote_written "${devs[1]}")
+    reflink_promote_settle "$target"
+    w1=$(reflink_promote_written "$target")
     dd if=/mnt/dst/f of=/dev/null bs=1M iflag=direct status=none
-    reflink_promote_settle "${devs[1]}"
-    w2=$(reflink_promote_written "${devs[1]}")
-    r2=$(reflink_promote_written "${devs[2]}")
+    reflink_promote_settle "$target"
+    w2=$(reflink_promote_written "$target")
+    r2=$(reflink_promote_written "$reader")
     echo "written to the promote target: first read $(( (w1 - w0) / 2 )) KiB, second read $(( (w2 - w1) / 2 )) KiB"
     echo "written to dst's promote target: $(( (r2 - r0) / 2 )) KiB"
 
@@ -1082,7 +1086,7 @@ reflink_promote_check()
     keys=$(bcachefs list -b reflink "${devs[@]}")
     echo "$keys" | head -30
     bcachefs fsck -ny "${devs[@]}"
-    cached=$(grep -E "ptr:[[:space:]]*$(basename "${devs[1]}") " <<< "$keys" | grep -c cached || true)
+    cached=$(grep -E "ptr:[[:space:]]*$(basename "$target") " <<< "$keys" | grep -c cached || true)
     echo "cached pointers on the promote target: $cached"
 
     if (( r2 - r0 >= 1024 )); then
@@ -1108,8 +1112,8 @@ test_reflink_promote_sticks()
 {
     set_watchdog 120
 
-    reflink_promote_setup
-    reflink_promote_check
+    reflink_promote_setup dst
+    reflink_promote_check 1 2
 }
 
 # The same, with the shared data at two replicas after the filesystem's
@@ -1119,11 +1123,22 @@ test_reflink_promote_sticks_over_replicated()
     set_watchdog 120
 
     local sysfs
-    reflink_promote_setup --data_replicas=2
+    reflink_promote_setup dst --data_replicas=2
     sysfs=$(echo /sys/fs/bcachefs/*-*-*-*-*)
     echo 0 > "$sysfs/options/reconcile_enabled"
     echo 1 > "$sysfs/options/data_replicas"
-    reflink_promote_check
+    reflink_promote_check 1 2
+}
+
+# src's own promote_target=cache is recorded in the shared data's reconcile
+# entry when the file is cloned, and the read promotes there; dst inherits the
+# filesystem's fast.
+test_reflink_promote_src_target()
+{
+    set_watchdog 120
+
+    reflink_promote_setup src
+    reflink_promote_check 2 1
 }
 
 # ---- reconcile target placement tests ----
