@@ -1119,6 +1119,67 @@ test_reflink_promote_sticks_over_replicated()
     reflink_promote_check
 }
 
+# A self-heal is a rewrite, and goes to background_target as moves and
+# reconcile do. With foreground_target=fast and both replicas on slow, every
+# read of slow0 fails its checksum; the replacement replicas must not be
+# written to fast. Metadata is on slow and nothing promotes, so only a
+# self-heal writes to fast.
+test_self_heal_background_target()
+{
+    ktest_expect_device_errors=1
+    [[ -f /sys/module/bcachefs/parameters/read_corrupt_ratio ]] || return 0
+    set_watchdog 120
+
+    local devs=("${ktest_scratch_dev[@]:0:4}") p=/sys/module/bcachefs/parameters
+    local sysfs f0 f1 s0 s1 keys onfast
+    run_quiet "" bcachefs format -f			\
+	--data_replicas=2				\
+	--metadata_target=slow				\
+	--foreground_target=fast			\
+	--background_target=slow			\
+	--label=slow.slow0 "${devs[0]}"			\
+	--label=fast.fast0 "${devs[1]}"			\
+	--label=cache.cache0 "${devs[2]}"		\
+	--label=slow.slow1 "${devs[3]}"
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+
+    dd if=/dev/urandom of=/mnt/f bs=1M count=8 oflag=direct
+    timeout 60 bcachefs reconcile wait /mnt
+    sysfs=$(echo /sys/fs/bcachefs/*-*-*-*-*)
+    echo 0 > "$sysfs/options/reconcile_enabled"
+
+    f0=$(reflink_promote_written "${devs[1]}")
+    s0=$(reflink_promote_written "${devs[0]}")
+    echo 0 > $p/force_read_device
+    echo 0 > $p/read_corrupt_device
+    echo 1 > $p/read_corrupt_ratio
+    dd if=/mnt/f of=/dev/null bs=1M iflag=direct status=none
+    echo 0 > $p/read_corrupt_ratio
+    echo -1 > $p/read_corrupt_device
+    echo -1 > $p/force_read_device
+    reflink_promote_settle "${devs[0]}"
+    reflink_promote_settle "${devs[1]}"
+    f1=$(reflink_promote_written "${devs[1]}")
+    s1=$(reflink_promote_written "${devs[0]}")
+    echo "self-heal writes: fast $(( (f1 - f0) / 2 )) KiB, slow0 $(( (s1 - s0) / 2 )) KiB"
+
+    umount /mnt
+    keys=$(bcachefs list -b extents "${devs[@]}")
+    echo "$keys" | head -30
+    bcachefs fsck -ny "${devs[@]}"
+    onfast=$(grep -E "ptr:[[:space:]]*$(basename "${devs[1]}") " <<< "$keys" | grep -c . || true)
+    echo "pointers on fast: $onfast"
+
+    if (( (f1 - f0) + (s1 - s0) < 8192 )); then
+	echo "ERROR: no self-heal - this run tests nothing"
+	exit 1
+    fi
+    if (( f1 - f0 >= 1024 )); then
+	echo "ERROR: self-heal wrote to foreground_target"
+	exit 1
+    fi
+}
+
 # ---- reconcile target placement tests ----
 #
 # A target with less durability than data_replicas/metadata_replicas (e.g.
