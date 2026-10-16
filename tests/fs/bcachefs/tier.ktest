@@ -1190,6 +1190,59 @@ test_reflink_derived_background_compression_follows_fs()
     bcachefs_test_end_checks "${devs[0]}"
 }
 
+# A directory with foreground_target=none, on a filesystem with
+# foreground_target=hdd and no background_target: the inode's
+# background_target is none, so after a reflink the shared data stays where it
+# is, as an unshared file there does. The files are written while the
+# directory has foreground_target=ssd, so that's where they are.
+test_reflink_keeps_derived_background_target_none()
+{
+    set_watchdog 120
+
+    local devs=("${ktest_scratch_dev[@]:0:3}")
+    run_quiet "" bcachefs format -f		\
+	--foreground_target=hdd			\
+	--label=ssd.ssd0 "${devs[0]}"		\
+	--label=hdd.hdd0 "${devs[1]}"		\
+	--label=hdd.hdd1 "${devs[2]}"
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+
+    mkdir /mnt/d
+    bcachefs set-file-option --foreground_target=ssd /mnt/d
+    dd if=/dev/urandom of=/mnt/d/f bs=1M count=8 oflag=direct
+    dd if=/dev/urandom of=/mnt/d/u bs=1M count=8 oflag=direct
+    bcachefs set-file-option --foreground_target=none /mnt/d
+    getfattr -n bcachefs_effective.foreground_target /mnt/d/f /mnt/d/u || true
+    timeout 60 bcachefs reconcile wait /mnt
+    cp --reflink=always /mnt/d/f /mnt/d/g
+    local ino
+    ino=$(stat -c %i /mnt/d/u)
+    reflink_derived_rescan ssd
+
+    local keys unshared s u
+    keys=$(reflink_derived_keys "${devs[@]}")
+    unshared=$(bcachefs list -b extents -s "$ino:0" -e "$((ino + 1)):0" "${devs[@]}")
+    echo "$keys" | head -20
+    s=($(reflink_derived_ptrs "$keys" "${devs[@]}"))
+    u=($(reflink_derived_ptrs "$unshared" "${devs[@]}"))
+    echo "shared data pointers: ${s[0]} on ssd, ${s[1]} on hdd"
+    echo "unshared data pointers: ${u[0]} on ssd, ${u[1]} on hdd"
+
+    if (( u[1] > 0 || u[0] == 0 )); then
+	echo "ERROR: the unshared file moved - this run tests nothing"
+	exit 1
+    fi
+    if (( s[0] + s[1] == 0 )); then
+	echo "ERROR: no shared data found - this run tests nothing"
+	exit 1
+    fi
+    if (( s[1] > 0 )); then
+	echo "ERROR: reconcile moved shared data to the filesystem's foreground_target"
+	exit 1
+    fi
+    bcachefs_test_end_checks "${devs[0]}"
+}
+
 # A read of shared data promotes by the shared data's own options, not the
 # reader's: the promote's index update judges the copy by them, so a copy made
 # to the reader's promote_target would be dropped and written again on every
