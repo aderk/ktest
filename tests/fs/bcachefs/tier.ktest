@@ -910,9 +910,17 @@ test_reflink_inode_opts()
 # reconcile scan of every extent, and let reconcile finish
 reflink_derived_set()
 {
-    local sysfs i
+    local sysfs
     sysfs=$(echo /sys/fs/bcachefs/*-*-*-*-*)
     echo "$2" > "$sysfs/options/$1"
+    reflink_derived_wait
+}
+
+# reflink_derived_wait: let reconcile finish
+reflink_derived_wait()
+{
+    local sysfs i
+    sysfs=$(echo /sys/fs/bcachefs/*-*-*-*-*)
     for (( i = 0; i < 3; i++ )); do
 	echo 1 > "$sysfs/internal/trigger_reconcile_wakeup"
 	timeout 60 bcachefs reconcile wait /mnt
@@ -1091,7 +1099,10 @@ test_reflink_keeps_derived_background_compression_none()
 # filesystem has no background_target. When the filesystem then sets
 # background_target=hdd, that becomes the inode's background_target as well,
 # so the shared data moves to hdd with the directory's unshared data.
-test_reflink_derived_background_target_follows_fs()
+#
+# reflink_derived_target_follows_fs [propagate]: with propagate, run
+# reflink-option-propagate on the clone after the filesystem's change
+reflink_derived_target_follows_fs()
 {
     set_watchdog 240
 
@@ -1113,6 +1124,12 @@ test_reflink_derived_background_target_follows_fs()
     ino=$(stat -c %i /mnt/fast/u)
     timeout 60 bcachefs reconcile wait /mnt
     reflink_derived_set background_target hdd
+    local after="the filesystem set one"
+    if [[ ${1:-} == propagate ]]; then
+	bcachefs reflink-option-propagate /mnt/fast/g
+	reflink_derived_wait
+	after="reflink-option-propagate"
+    fi
 
     local keys unshared s u
     keys=$(reflink_derived_keys "${devs[@]}")
@@ -1132,10 +1149,21 @@ test_reflink_derived_background_target_follows_fs()
 	exit 1
     fi
     if (( s[0] > 0 )); then
-	echo "ERROR: shared data kept the derived background_target after the filesystem set one"
+	echo "ERROR: shared data kept the derived background_target after $after"
 	exit 1
     fi
     bcachefs_test_end_checks "${devs[0]}"
+}
+
+test_reflink_derived_background_target_follows_fs()
+{
+    reflink_derived_target_follows_fs
+}
+
+# reflink-option-propagate writes the inode's options into the record again.
+test_reflink_derived_background_target_propagate()
+{
+    reflink_derived_target_follows_fs propagate
 }
 
 # The same for background_compression: a directory with only compression=lz4
