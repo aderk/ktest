@@ -1119,63 +1119,182 @@ test_reflink_promote_sticks_over_replicated()
     reflink_promote_check
 }
 
-# A self-heal is a rewrite, and goes to background_target as moves and
-# reconcile do. With foreground_target=fast and both replicas on slow, every
-# read of slow0 fails its checksum; the replacement replicas must not be
-# written to fast. Metadata is on slow and nothing promotes, so only a
-# self-heal writes to fast.
-test_self_heal_background_target()
-{
-    ktest_expect_device_errors=1
-    [[ -f /sys/module/bcachefs/parameters/read_corrupt_ratio ]] || return 0
-    set_watchdog 120
+# ---- self-heal placement tests ----
+#
+# An 8M file has two replicas, on slow0 and slow1, and every read of slow0
+# fails its checksum, so a read of the file self-heals: the replacement
+# replicas go to the self-heal's target, or where its fallbacks send them.
+# Metadata is on slow and nothing promotes.
 
-    local devs=("${ktest_scratch_dev[@]:0:4}") p=/sys/module/bcachefs/parameters
-    local sysfs f0 f1 s0 s1 keys onfast
+# self_heal_setup <foreground_target>: formats and mounts, with
+# background_target=slow
+self_heal_setup()
+{
+    local devs=("${ktest_scratch_dev[@]:0:4}")
     run_quiet "" bcachefs format -f			\
 	--data_replicas=2				\
 	--metadata_target=slow				\
-	--foreground_target=fast			\
+	--foreground_target="$1"			\
 	--background_target=slow			\
 	--label=slow.slow0 "${devs[0]}"			\
 	--label=fast.fast0 "${devs[1]}"			\
 	--label=cache.cache0 "${devs[2]}"		\
 	--label=slow.slow1 "${devs[3]}"
     mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+}
 
-    dd if=/dev/urandom of=/mnt/f bs=1M count=8 oflag=direct
+# self_heal_reconcile_off: lets reconcile put the data on slow, then turns it
+# off, so that only the self-heal writes data
+self_heal_reconcile_off()
+{
     timeout 60 bcachefs reconcile wait /mnt
-    sysfs=$(echo /sys/fs/bcachefs/*-*-*-*-*)
-    echo 0 > "$sysfs/options/reconcile_enabled"
+    echo 0 > /sys/fs/bcachefs/*-*-*-*-*/options/reconcile_enabled
+}
 
-    f0=$(reflink_promote_written "${devs[1]}")
-    s0=$(reflink_promote_written "${devs[0]}")
+# self_heal_read <file>: reads <file> with every read of slow0 failing its
+# checksum, and sets self_heal_kib to what slow0, fast0 and cache0 were
+# written meanwhile, in KiB
+self_heal_read()
+{
+    local devs=("${ktest_scratch_dev[@]:0:4}") p=/sys/module/bcachefs/parameters i
+    local -a w0
+    for i in 0 1 2; do
+	w0[i]=$(reflink_promote_written "${devs[i]}")
+    done
     echo 0 > $p/force_read_device
     echo 0 > $p/read_corrupt_device
     echo 1 > $p/read_corrupt_ratio
-    dd if=/mnt/f of=/dev/null bs=1M iflag=direct status=none
+    dd if="$1" of=/dev/null bs=1M iflag=direct status=none
     echo 0 > $p/read_corrupt_ratio
     echo -1 > $p/read_corrupt_device
     echo -1 > $p/force_read_device
-    reflink_promote_settle "${devs[0]}"
-    reflink_promote_settle "${devs[1]}"
-    f1=$(reflink_promote_written "${devs[1]}")
-    s1=$(reflink_promote_written "${devs[0]}")
-    echo "self-heal writes: fast $(( (f1 - f0) / 2 )) KiB, slow0 $(( (s1 - s0) / 2 )) KiB"
+    self_heal_kib=()
+    for i in 0 1 2; do
+	reflink_promote_settle "${devs[i]}"
+	self_heal_kib[i]=$(( ($(reflink_promote_written "${devs[i]}") - w0[i]) / 2 ))
+    done
+    echo "self-heal writes: slow0 ${self_heal_kib[0]} KiB, fast0 ${self_heal_kib[1]} KiB, cache0 ${self_heal_kib[2]} KiB"
+}
 
+# self_heal_end: unmounts and checks the filesystem
+self_heal_end()
+{
     umount /mnt
-    keys=$(bcachefs list -b extents "${devs[@]}")
-    echo "$keys" | head -30
-    bcachefs fsck -ny "${devs[@]}"
-    onfast=$(grep -E "ptr:[[:space:]]*$(basename "${devs[1]}") " <<< "$keys" | grep -c . || true)
-    echo "pointers on fast: $onfast"
+    bcachefs fsck -ny "${ktest_scratch_dev[@]:0:4}"
+}
 
-    if (( (f1 - f0) + (s1 - s0) < 8192 )); then
+# A self-heal is a rewrite, and goes to background_target as moves and
+# reconcile do: with foreground_target=fast, nothing may be written to fast.
+test_self_heal_background_target()
+{
+    ktest_expect_device_errors=1
+    [[ -f /sys/module/bcachefs/parameters/read_corrupt_ratio ]] || return 0
+    set_watchdog 120
+
+    self_heal_setup fast
+    dd if=/dev/urandom of=/mnt/f bs=1M count=8 oflag=direct
+    self_heal_reconcile_off
+    self_heal_read /mnt/f
+    self_heal_end
+
+    if (( self_heal_kib[0] + self_heal_kib[1] < 8192 )); then
 	echo "ERROR: no self-heal - this run tests nothing"
 	exit 1
     fi
-    if (( f1 - f0 >= 1024 )); then
+    if (( self_heal_kib[1] >= 1024 )); then
 	echo "ERROR: self-heal wrote to foreground_target"
+	exit 1
+    fi
+}
+
+# With background_target unset, bch2_io_opts_fixups() gives it
+# foreground_target's value, and a self-heal goes there: to fast0, the one
+# fast device.
+test_self_heal_background_target_unset()
+{
+    ktest_expect_device_errors=1
+    [[ -f /sys/module/bcachefs/parameters/read_corrupt_ratio ]] || return 0
+    set_watchdog 120
+
+    local sysfs
+    self_heal_setup fast
+    dd if=/dev/urandom of=/mnt/f bs=1M count=8 oflag=direct
+    self_heal_reconcile_off
+    sysfs=$(echo /sys/fs/bcachefs/*-*-*-*-*)
+    echo none > "$sysfs/options/background_target"
+    echo "background_target: $(cat "$sysfs/options/background_target")"
+    self_heal_read /mnt/f
+    self_heal_end
+
+    if (( self_heal_kib[1] < 8192 )); then
+	echo "ERROR: self-heal didn't write to foreground_target"
+	exit 1
+    fi
+    if (( self_heal_kib[0] + self_heal_kib[2] >= 1024 )); then
+	echo "ERROR: self-heal wrote outside foreground_target"
+	exit 1
+    fi
+}
+
+# A self-heal doesn't set BCH_WRITE_only_specified_devs: when its target can't
+# take the write, it goes to any device. Here background_target is cache, and
+# cache0 is read-only.
+test_self_heal_target_read_only()
+{
+    ktest_expect_device_errors=1
+    [[ -f /sys/module/bcachefs/parameters/read_corrupt_ratio ]] || return 0
+    set_watchdog 120
+
+    local devs=("${ktest_scratch_dev[@]:0:4}") sysfs
+    self_heal_setup fast
+    dd if=/dev/urandom of=/mnt/f bs=1M count=8 oflag=direct
+    self_heal_reconcile_off
+    sysfs=$(echo /sys/fs/bcachefs/*-*-*-*-*)
+    bcachefs device set-state ro "${devs[2]}"
+    echo cache > "$sysfs/options/background_target"
+    self_heal_read /mnt/f
+    self_heal_end
+
+    if (( self_heal_kib[2] >= 1024 )); then
+	echo "ERROR: self-heal wrote to a read-only device"
+	exit 1
+    fi
+    if (( self_heal_kib[0] + self_heal_kib[1] < 8192 )); then
+	echo "ERROR: no self-heal: its target was read-only, and it didn't go elsewhere"
+	exit 1
+    fi
+}
+
+# The same with a full target: background_target is fast, and fast0 (1G) is
+# full of another file's data.
+test_self_heal_target_full()
+{
+    ktest_expect_device_errors=1
+    [[ -f /sys/module/bcachefs/parameters/read_corrupt_ratio ]] || return 0
+    set_watchdog 180
+
+    local devs=("${ktest_scratch_dev[@]:0:4}") sysfs w0 w1
+    self_heal_setup slow
+    dd if=/dev/urandom of=/mnt/f bs=1M count=8 oflag=direct
+    self_heal_reconcile_off
+    sysfs=$(echo /sys/fs/bcachefs/*-*-*-*-*)
+    mkdir /mnt/fill
+    bcachefs set-file-option --data_replicas=1 --foreground_target=fast --background_target=fast /mnt/fill
+    w0=$(reflink_promote_written "${devs[1]}")
+    dd if=/dev/zero of=/mnt/fill/f bs=1M count=1280 oflag=direct status=none
+    w1=$(reflink_promote_written "${devs[1]}")
+    echo "fill: $(( (w1 - w0) / 2048 )) MiB to fast0"
+    head -30 "$sysfs/dev-1/alloc_debug"
+    echo fast > "$sysfs/options/background_target"
+    self_heal_read /mnt/f
+    self_heal_end
+
+    if (( self_heal_kib[1] >= 1024 )); then
+	echo "ERROR: self-heal wrote to a full device"
+	exit 1
+    fi
+    if (( self_heal_kib[0] + self_heal_kib[2] < 8192 )); then
+	echo "ERROR: no self-heal: its target was full, and it didn't go elsewhere"
 	exit 1
     fi
 }
