@@ -1026,13 +1026,15 @@ reflink_derived_ptrs()
     echo "$a $b"
 }
 
-# reflink_derived_compression <keys>: "<lz4> <uncompressed>"
+# reflink_derived_compression <keys> [<a> <b>]: "<pointers compressed with a>
+# <with b>", by default lz4 and none; a key without a crc entry counts as none
 reflink_derived_compression()
 {
-    awk '/ type / { c = "" }
-	 /compress / { c = $0 }
-	 /ptr:/ && !/cached/ { if (c ~ /compress lz4/) l++; else if (c ~ /compress none/) n++ }
-	 END { print l + 0, n + 0 }' <<< "$1"
+    awk -v a="${2:-lz4}" -v b="${3:-none}"				\
+	'/ type / { c = "none" }
+	 /compress / { c = $0; sub(/.*compress /, "", c); sub(/ .*/, "", c) }
+	 /ptr:/ && !/cached/ { if (c == a) x++; else if (c == b) y++ }
+	 END { print x + 0, y + 0 }' <<< "$1"
 }
 
 # A directory with only compression=none, on a filesystem with
@@ -1131,6 +1133,58 @@ test_reflink_derived_background_target_follows_fs()
     fi
     if (( s[0] > 0 )); then
 	echo "ERROR: shared data kept the derived background_target after the filesystem set one"
+	exit 1
+    fi
+    bcachefs_test_end_checks "${devs[0]}"
+}
+
+# The same for background_compression: a directory with only compression=lz4
+# is cloned while the filesystem has no background_compression, then the
+# filesystem sets background_compression=zstd. That is the inode's
+# background_compression too, so the shared data is rewritten with zstd, as
+# the directory's unshared data is.
+test_reflink_derived_background_compression_follows_fs()
+{
+    set_watchdog 240
+
+    local devs=("${ktest_scratch_dev[@]:0:3}")
+    run_quiet "" bcachefs format -f		\
+	--label=hdd.hdd0 "${devs[0]}"		\
+	--label=hdd.hdd1 "${devs[1]}"		\
+	--label=hdd.hdd2 "${devs[2]}"
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+
+    mkdir /mnt/c
+    bcachefs set-file-option --compression=lz4 /mnt/c
+
+    awk 'BEGIN { for (i = 0; i < 230000; i++) print "bcachefs reflink derived compression" }' > /mnt/c/f
+    cp --reflink=never /mnt/c/f /mnt/c/u
+    sync /mnt/c/f /mnt/c/u
+    cp --reflink=always /mnt/c/f /mnt/c/g
+    local ino
+    ino=$(stat -c %i /mnt/c/u)
+    timeout 60 bcachefs reconcile wait /mnt
+    reflink_derived_set background_compression zstd
+
+    local keys unshared s u
+    keys=$(reflink_derived_keys "${devs[@]}")
+    unshared=$(bcachefs list -b extents -s "$ino:0" -e "$((ino + 1)):0" "${devs[@]}")
+    echo "$keys" | head -40
+    s=($(reflink_derived_compression "$keys" zstd lz4))
+    u=($(reflink_derived_compression "$unshared" zstd lz4))
+    echo "shared extents: ${s[0]} zstd, ${s[1]} lz4"
+    echo "unshared extents: ${u[0]} zstd, ${u[1]} lz4"
+
+    if (( u[1] > 0 || u[0] == 0 )); then
+	echo "ERROR: the unshared file wasn't rewritten with the new background_compression - this run tests nothing"
+	exit 1
+    fi
+    if (( s[0] + s[1] == 0 )); then
+	echo "ERROR: no shared extents - this run tests nothing"
+	exit 1
+    fi
+    if (( s[1] > 0 )); then
+	echo "ERROR: shared data kept the derived background_compression after the filesystem set one"
 	exit 1
     fi
     bcachefs_test_end_checks "${devs[0]}"
