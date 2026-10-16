@@ -1346,6 +1346,86 @@ test_reflink_derived_provenance_rename()
     reflink_derived_provenance rename
 }
 
+# reflink_derived_csum <keys>: "<checksummed> <not checksummed>" pointers
+reflink_derived_csum()
+{
+    awk '/ type / { c = "none" }
+	 / csum / { c = $0; sub(/.* csum /, "", c); sub(/ .*/, "", c) }
+	 /ptr:/ && !/cached/ { if (c == "none") n++; else y++ }
+	 END { print y + 0, n + 0 }' <<< "$1"
+}
+
+# A clone of a file in a directory with nocow, on a filesystem with
+# compression=lz4: nocow clears the inode's compression, background_compression
+# and data_checksum, and the shared data stays as the directory's unshared data
+# is, without compression or checksums.
+#
+# reflink_derived_nocow [<options>...]: more options for the directory
+reflink_derived_nocow()
+{
+    set_watchdog 120
+
+    local devs=("${ktest_scratch_dev[@]:0:3}")
+    run_quiet "" bcachefs format -f		\
+	--compression=lz4			\
+	--label=hdd.hdd0 "${devs[0]}"		\
+	--label=hdd.hdd1 "${devs[1]}"		\
+	--label=hdd.hdd2 "${devs[2]}"
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+
+    mkdir /mnt/c
+    bcachefs set-file-option --nocow=1 "$@" /mnt/c
+
+    awk 'BEGIN { for (i = 0; i < 230000; i++) print "bcachefs reflink derived compression" }' > /mnt/c/f
+    cp --reflink=never /mnt/c/f /mnt/c/u
+    sync /mnt/c/f /mnt/c/u
+    cp --reflink=always /mnt/c/f /mnt/c/g
+    local ino
+    ino=$(stat -c %i /mnt/c/u)
+    reflink_derived_rescan hdd
+
+    local keys unshared s u sc uc
+    keys=$(reflink_derived_keys "${devs[@]}")
+    unshared=$(bcachefs list -b extents -s "$ino:0" -e "$((ino + 1)):0" "${devs[@]}")
+    echo "$keys" | head -40
+    s=($(reflink_derived_compression "$keys"))
+    u=($(reflink_derived_compression "$unshared"))
+    sc=($(reflink_derived_csum "$keys"))
+    uc=($(reflink_derived_csum "$unshared"))
+    echo "shared extents: ${s[0]} lz4, ${s[1]} uncompressed; ${sc[0]} checksummed, ${sc[1]} not"
+    echo "unshared extents: ${u[0]} lz4, ${u[1]} uncompressed; ${uc[0]} checksummed, ${uc[1]} not"
+
+    if (( s[0] + s[1] == 0 )); then
+	echo "ERROR: no shared extents - this run tests nothing"
+	exit 1
+    fi
+    if (( u[0] > 0 || u[1] == 0 || uc[0] > 0 )); then
+	echo "ERROR: the unshared file was compressed or checksummed - this run tests nothing"
+	exit 1
+    fi
+    if (( s[0] > 0 )); then
+	echo "ERROR: reconcile compressed shared data by the filesystem's compression"
+	exit 1
+    fi
+    if (( sc[0] > 0 )); then
+	echo "ERROR: reconcile checksummed shared data by the filesystem's data_checksum"
+	exit 1
+    fi
+    bcachefs_test_end_checks "${devs[0]}"
+}
+
+test_reflink_keeps_nocow()
+{
+    reflink_derived_nocow
+}
+
+# With the directory's own background_compression, the 0 nocow leaves is the
+# inode's; data_checksum=none keeps checksums out of it.
+test_reflink_keeps_derived_background_compression_nocow()
+{
+    reflink_derived_nocow --background_compression=lz4 --data_checksum=none
+}
+
 # A read of shared data promotes by the shared data's own options, not the
 # reader's: the promote's index update judges the copy by them, so a copy made
 # to the reader's promote_target would be dropped and written again on every
