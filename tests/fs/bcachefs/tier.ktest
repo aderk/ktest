@@ -1426,6 +1426,50 @@ test_reflink_keeps_derived_background_compression_nocow()
     reflink_derived_nocow --background_compression=lz4 --data_checksum=none
 }
 
+# A direct extent has a record only while it has reconcile work: here a file
+# in a directory with only compression=lz4 still has to move to the
+# filesystem's background_target, as reconcile is off. Its record marks the
+# derived background_compression as the inode's.
+test_derived_direct_extent_record()
+{
+    set_watchdog 120
+
+    local devs=("${ktest_scratch_dev[@]:0:3}")
+    run_quiet "" bcachefs format -f		\
+	--foreground_target=ssd			\
+	--background_target=hdd			\
+	--label=ssd.ssd0 "${devs[0]}"		\
+	--label=hdd.hdd0 "${devs[1]}"		\
+	--label=hdd.hdd1 "${devs[2]}"
+    mount -t bcachefs -o noreconcile_enabled "$(join_by : "${devs[@]}")" /mnt
+
+    mkdir /mnt/c
+    bcachefs set-file-option --compression=lz4 /mnt/c
+    awk 'BEGIN { for (i = 0; i < 230000; i++) print "bcachefs reflink derived compression" }' > /mnt/c/f
+    sync /mnt/c/f
+    local ino
+    ino=$(stat -c %i /mnt/c/f)
+    umount /mnt
+
+    local keys
+    keys=$(bcachefs list -b extents -s "$ino:0" -e "$((ino + 1)):0" "${devs[@]}")
+    echo "$keys" | head -12
+    if ! grep -q "reconcile: need_rb=[^ ]*background_target" <<< "$keys"; then
+	echo "ERROR: the extents have no pending move - this run tests nothing"
+	exit 1
+    fi
+    if ! grep -q "background_compression=lz4 (inode)" <<< "$keys"; then
+	echo "ERROR: the record doesn't mark the derived background_compression as the inode's"
+	exit 1
+    fi
+
+    mount -t bcachefs "$(join_by : "${devs[@]}")" /mnt
+    reflink_derived_wait
+    umount /mnt
+    bcachefs fsck -ny "${devs[@]}"
+    bcachefs_test_end_checks "${devs[0]}"
+}
+
 # A read of shared data promotes by the shared data's own options, not the
 # reader's: the promote's index update judges the copy by them, so a copy made
 # to the reader's promote_target would be dropped and written again on every
